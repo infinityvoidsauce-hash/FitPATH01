@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { Send, Mic, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { useToast } from "@/hooks/use-toast";
 import ChatMessage from "@/components/ChatMessage";
 
 interface Message {
@@ -11,47 +12,116 @@ interface Message {
   timestamp: string;
 }
 
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 const quickPrompts = [
-  "Suggest a workout",
-  "How to improve form?",
-  "Nutrition tips",
-  "Recovery advice",
+  "Suggest a workout for today",
+  "How can I improve my squat form?",
+  "Give me nutrition tips for muscle gain",
+  "What's the best recovery routine?",
 ];
 
-const botResponses: Record<string, string> = {
-  "suggest a workout": "Based on your recent activity, I recommend a 25-minute HIIT session today! It'll help boost your metabolism and complement your strength training from yesterday. Want me to show you the exercises?",
-  "how to improve form": "Great question! Proper form is crucial for results and injury prevention. For squats, focus on: 1) Keep your chest up, 2) Push your knees out over your toes, 3) Go as deep as your mobility allows. Would you like tips for any specific exercise?",
-  "nutrition tips": "To maximize your workouts, focus on: 1) Eating protein within 30 mins post-workout (20-30g), 2) Staying hydrated (aim for 3L daily), 3) Complex carbs for energy. What's your current goal - muscle building or fat loss?",
-  "recovery advice": "Recovery is when the magic happens! Here's what I recommend: 1) Sleep 7-9 hours, 2) Light stretching or yoga on rest days, 3) Foam rolling for 10 mins, 4) Stay hydrated. How are you currently recovering between sessions?",
-};
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/fitness-coach`;
 
-const getResponse = (input: string): string => {
-  const lowerInput = input.toLowerCase();
-  
-  for (const [key, response] of Object.entries(botResponses)) {
-    if (lowerInput.includes(key) || key.includes(lowerInput)) {
-      return response;
+async function streamChat({
+  messages,
+  onDelta,
+  onDone,
+  onError,
+}: {
+  messages: ChatMessage[];
+  onDelta: (deltaText: string) => void;
+  onDone: () => void;
+  onError: (error: string) => void;
+}) {
+  const resp = await fetch(CHAT_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ messages }),
+  });
+
+  if (!resp.ok) {
+    const errorData = await resp.json().catch(() => ({ error: "Failed to connect to AI coach" }));
+    onError(errorData.error || "Failed to get response");
+    return;
+  }
+
+  if (!resp.body) {
+    onError("No response body");
+    return;
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let textBuffer = "";
+  let streamDone = false;
+
+  while (!streamDone) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    textBuffer += decoder.decode(value, { stream: true });
+
+    let newlineIndex: number;
+    while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
+      let line = textBuffer.slice(0, newlineIndex);
+      textBuffer = textBuffer.slice(newlineIndex + 1);
+
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      if (line.startsWith(":") || line.trim() === "") continue;
+      if (!line.startsWith("data: ")) continue;
+
+      const jsonStr = line.slice(6).trim();
+      if (jsonStr === "[DONE]") {
+        streamDone = true;
+        break;
+      }
+
+      try {
+        const parsed = JSON.parse(jsonStr);
+        const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+        if (content) onDelta(content);
+      } catch {
+        textBuffer = line + "\n" + textBuffer;
+        break;
+      }
     }
   }
-  
-  const defaultResponses = [
-    "That's a great question! As your AI fitness coach, I'm here to help you reach your goals. Could you tell me more about what you're looking to achieve?",
-    "I love your enthusiasm! 💪 Let me help you with that. What specific aspect of your fitness journey would you like to focus on?",
-    "Awesome! I'm analyzing your progress and have some personalized suggestions. What would you like to work on - strength, endurance, or flexibility?",
-  ];
-  
-  return defaultResponses[Math.floor(Math.random() * defaultResponses.length)];
-};
+
+  if (textBuffer.trim()) {
+    for (let raw of textBuffer.split("\n")) {
+      if (!raw) continue;
+      if (raw.endsWith("\r")) raw = raw.slice(0, -1);
+      if (raw.startsWith(":") || raw.trim() === "") continue;
+      if (!raw.startsWith("data: ")) continue;
+      const jsonStr = raw.slice(6).trim();
+      if (jsonStr === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(jsonStr);
+        const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+        if (content) onDelta(content);
+      } catch { /* ignore partial leftovers */ }
+    }
+  }
+
+  onDone();
+}
 
 const Coach = () => {
+  const { toast } = useToast();
   const [messages, setMessages] = useState<Message[]>([
     {
       id: 1,
-      text: "Hey there! 👋 I'm your AI fitness coach. I'm here to help you crush your fitness goals with personalized workout advice, form tips, and motivation. What can I help you with today?",
+      text: "Hey there! 👋 I'm your AI fitness coach powered by real AI. I'm here to help you crush your fitness goals with personalized workout advice, form tips, nutrition guidance, and motivation. What can I help you with today?",
       isBot: true,
       timestamp: "Just now",
     },
   ]);
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [isTyping, setIsTyping] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -66,7 +136,7 @@ const Coach = () => {
 
   const handleSend = async (text?: string) => {
     const messageText = text || inputValue;
-    if (!messageText.trim()) return;
+    if (!messageText.trim() || isTyping) return;
 
     const userMessage: Message = {
       id: messages.length + 1,
@@ -75,21 +145,58 @@ const Coach = () => {
       timestamp: "Just now",
     };
 
+    const newChatHistory: ChatMessage[] = [...chatHistory, { role: "user", content: messageText }];
+    
     setMessages((prev) => [...prev, userMessage]);
+    setChatHistory(newChatHistory);
     setInputValue("");
     setIsTyping(true);
 
-    // Simulate AI response delay
-    setTimeout(() => {
-      const botMessage: Message = {
-        id: messages.length + 2,
-        text: getResponse(messageText),
-        isBot: true,
-        timestamp: "Just now",
-      };
-      setMessages((prev) => [...prev, botMessage]);
+    let assistantContent = "";
+    
+    const updateAssistantMessage = (chunk: string) => {
+      assistantContent += chunk;
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.isBot && last.id === messages.length + 2) {
+          return prev.map((m, i) => 
+            i === prev.length - 1 ? { ...m, text: assistantContent } : m
+          );
+        }
+        return [...prev, {
+          id: messages.length + 2,
+          text: assistantContent,
+          isBot: true,
+          timestamp: "Just now",
+        }];
+      });
+    };
+
+    try {
+      await streamChat({
+        messages: newChatHistory,
+        onDelta: updateAssistantMessage,
+        onDone: () => {
+          setIsTyping(false);
+          setChatHistory((prev) => [...prev, { role: "assistant", content: assistantContent }]);
+        },
+        onError: (error) => {
+          setIsTyping(false);
+          toast({
+            title: "Error",
+            description: error,
+            variant: "destructive",
+          });
+        },
+      });
+    } catch (error) {
       setIsTyping(false);
-    }, 1500);
+      toast({
+        title: "Connection Error",
+        description: "Failed to connect to AI coach. Please try again.",
+        variant: "destructive",
+      });
+    }
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
